@@ -1,0 +1,14 @@
+{
+  "appId": "com.turkmavzercell.istakip",
+  "appName": "MİT",
+  "webDir": "www",
+  "backgroundColor": "#111827",
+  "android": {
+    "backgroundColor": "#111827",
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
