@@ -1,1 +1,50 @@
+name: Build APK
 
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Node kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Java kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Bağımlılıkları kur
+        run: npm install
+
+      - name: Android projesini oluştur (Capacitor)
+        run: npx cap add android
+
+      - name: Web dosyalarını senkronize et
+        run: npx cap sync android
+
+      - name: Durum çubuğunu koyu temaya uydur
+        run: |
+          sed -i 's/name="colorPrimaryDark">#[0-9A-Fa-f]*/name="colorPrimaryDark">#111827/' android/app/src/main/res/values/styles.xml || true
+          sed -i 's/name="colorPrimary">#[0-9A-Fa-f]*/name="colorPrimary">#111827/' android/app/src/main/res/values/styles.xml || true
+
+      - name: Gradle çalıştırma izni ver
+        run: chmod +x android/gradlew
+
+      - name: APK derle (debug - imzasız, doğrudan kurulabilir)
+        run: cd android && ./gradlew assembleDebug --no-daemon
+
+      - name: APK dosyasını yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mit-uygulama-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
