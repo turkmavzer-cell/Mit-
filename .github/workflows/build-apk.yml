@@ -29,6 +29,9 @@ jobs:
       - name: Android projesini oluştur (Capacitor)
         run: npx cap add android
 
+      - name: Uygulama ikonunu oluştur
+        run: npx capacitor-assets generate --android --iconBackgroundColor '#111827' --iconBackgroundColorDark '#111827'
+
       - name: Web dosyalarını senkronize et
         run: npx cap sync android
 
