@@ -547,9 +547,70 @@ function mergeBackupCustomers(current, backupCustomers) {
   });
   return result;
 }
+/* ============ Native (APK) tespiti ============
+   Android WebView, blob: indirmeyi ve navigator.share'i güvenilir şekilde
+   desteklemiyor (bilinen bir Capacitor/WebView kısıtlaması). Uygulama APK
+   olarak paketlendiğinde Capacitor'ın kendi native köprüsü (window.Capacitor)
+   hazır bulunur; o zaman gerçek Android dosya sistemine ve paylaşım
+   penceresine bağlanan Filesystem + Share eklentilerini kullanıyoruz.
+   Düz tarayıcıda (örn. önizleme testi) çalışırken eski web API'lerine
+   düşüyoruz, böylece iki ortamda da çalışır. */
+function isNativeApp() {
+  return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+}
+
+function utf8ToBase64(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+function blobToBase64(blob) {
+  return new Promise(function (resolve, reject) {
+    var reader = new FileReader();
+    reader.onerror = function () { reject(new Error('Blob okunamadı')); };
+    reader.onload = function () {
+      var result = String(reader.result);
+      // "data:image/png;base64,AAAA..." -> sadece "AAAA..." kısmını al
+      var comma = result.indexOf(',');
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function nativeWriteAndGetUri(filename, base64Data, directory, encoding) {
+  var Filesystem = window.Capacitor.Plugins.Filesystem;
+  var opts = { path: filename, data: base64Data, directory: directory };
+  if (encoding) opts.encoding = encoding;
+  await Filesystem.writeFile(opts);
+  var uriResult = await Filesystem.getUri({ path: filename, directory: directory });
+  return uriResult.uri;
+}
+
+async function nativeShareFile(uri, title) {
+  var Share = window.Capacitor.Plugins.Share;
+  await Share.share({ title: title, files: [uri] });
+}
+
 async function downloadAndShareBackup(customers) {
   var backup = buildBackup(customers);
   var json = JSON.stringify(backup, null, 2);
+
+  if (isNativeApp()) {
+    try {
+      var uri = await nativeWriteAndGetUri('mit-yedek.json', json, 'DOCUMENTS', 'utf8');
+      try {
+        await nativeShareFile(uri, 'MİT Yedek Dosyası');
+      } catch (shareErr) {
+        console.info('paylaşım penceresi kapatıldı/iptal', shareErr);
+      }
+      return;
+    } catch (err) {
+      console.error('native yedekleme hatası', err);
+      throw err;
+    }
+  }
+
+  // Web (tarayıcı) yedek yolu
   var blob = new Blob([json], { type: 'application/json' });
   var url = URL.createObjectURL(blob);
   var link = document.createElement('a');
@@ -563,7 +624,21 @@ async function downloadAndShareBackup(customers) {
     }
   } catch (e) { console.info('paylaşım iptal/desteklenmiyor', e); }
 }
+
 async function shareImageBlob(blob, filename) {
+  if (isNativeApp()) {
+    try {
+      var base64 = await blobToBase64(blob);
+      var uri = await nativeWriteAndGetUri(filename, base64, 'CACHE');
+      await nativeShareFile(uri, 'İş Özeti');
+      return 'shared';
+    } catch (err) {
+      console.error('native paylaşım hatası', err);
+      throw err;
+    }
+  }
+
+  // Web (tarayıcı) paylaşım/indirme yolu
   try {
     var file = new File([blob], filename, { type: 'image/png' });
     if (navigator.canShare && navigator.share && navigator.canShare({ files: [file] })) {
@@ -1923,660 +1998,3 @@ Modals.showJobForm = function (customer, job) {
 
     var el = document.getElementById(id);
     if (!el) el = Modals.openSheet(id, html, { wide: true });
-    else el.querySelector('.mit-modal-sheet').innerHTML = html;
-
-    renderUnassignedPanel();
-    renderGroupsList();
-    wireStatic();
-  }
-
-  function photosGridHtml() {
-    if (!draft.photos.length) return '<p class="mit-empty-inline">Henüz fotoğraf eklenmedi</p>';
-    return '<div class="mit-photo-grid">' + draft.photos.map(function (photo, i) {
-      return '<div class="mit-photo-tile"><img src="' + photo + '" alt="Fotoğraf ' + (i + 1) + '" data-photo-view="' + i + '" />' +
-        '<button class="mit-tile-action mit-tile-action-right" data-photo-delete="' + i + '" aria-label="Fotoğrafı sil">' + icon('x', 14) + '</button></div>';
-    }).join('') + '</div>';
-  }
-
-  function renderUnassignedPanel() {
-    var container = document.getElementById('jf-unassigned-panel');
-    if (!container) return;
-    if (!rollControllers.unassigned) {
-      rollControllers.unassigned = createFabricRollController(
-        function () { return draft.unassignedRolls; },
-        function (rolls) { draft.unassignedRolls = rolls; refreshTotalsOnly(); },
-        function () { return draft.fabricGramsPerMeter; }
-      );
-    }
-    container.innerHTML = '<div id="jf-unassigned-roll-ui"></div>';
-    rollControllers.unassigned.renderInto('jf-unassigned-roll-ui', renderSendButton);
-  }
-
-  var selectedUnassigned = {};
-
-  function paintSendButton() {
-    var wrap = document.getElementById('jf-send-btn-wrap');
-    if (!wrap) return;
-    var count = Object.keys(selectedUnassigned).filter(function (k) { return selectedUnassigned[k]; }).length;
-    if (count > 0) {
-      wrap.innerHTML = '<button class="mit-btn mit-btn-primary mit-btn-block mit-mt-sm" id="jf-send-rolls">' +
-        icon('send', 16) + ' ' + count + ' top seçildi · Kalıba Gönder</button>';
-      document.getElementById('jf-send-rolls').onclick = openSendToGroupPicker;
-    } else {
-      wrap.innerHTML = '';
-    }
-  }
-
-  // Her yeniden çizimden sonra çağrılır: topların seçim durumunu ve tıklama
-  // dinleyicilerini yeniden bağlar (yeniden çizim eski dinleyicileri siler).
-  function renderSendButton() {
-    var rollUi = document.getElementById('jf-unassigned-roll-ui');
-    if (!rollUi) return;
-    // Artık var olmayan topların seçimini temizle
-    var existingIds = {};
-    draft.unassignedRolls.forEach(function (r) { existingIds[r.id] = true; });
-    Object.keys(selectedUnassigned).forEach(function (k) {
-      if (!existingIds[k]) delete selectedUnassigned[k];
-    });
-
-    Array.prototype.forEach.call(rollUi.querySelectorAll('[data-roll-chip]'), function (chip) {
-      var rollId = chip.dataset.rollChip;
-      if (selectedUnassigned[rollId]) chip.classList.add('mit-chip-selected');
-      chip.addEventListener('click', function (e) {
-        if (e.target.closest('[data-roll-delete]')) return;
-        selectedUnassigned[rollId] = !selectedUnassigned[rollId];
-        chip.classList.toggle('mit-chip-selected', !!selectedUnassigned[rollId]);
-        paintSendButton();
-      });
-    });
-    paintSendButton();
-  }
-
-  function openSendToGroupPicker() {
-    var selectedIds = Object.keys(selectedUnassigned).filter(function (k) { return selectedUnassigned[k]; });
-    var selectedRolls = draft.unassignedRolls.filter(function (r) { return selectedIds.indexOf(r.id) >= 0; });
-    if (!selectedRolls.length) return;
-
-    var pickId = 'modal-send-to-group';
-    var groupsHtml = draft.patternGroups.map(function (g) {
-      return '<button class="mit-list-item" data-choose-group="' + g.id + '">' + icon('tag', 15, 'mit-accent') + ' ' + esc(g.patternName || 'İsimsiz Kalıp') + '</button>';
-    }).join('');
-    var html = '<div class="mit-modal-header"><h3>' + selectedRolls.length + ' Top Hangi Kalıba Gönderilsin?</h3>' +
-      '<button class="mit-icon-btn" data-close="1">' + icon('x', 22) + '</button></div>' +
-      '<div class="mit-modal-content">' + groupsHtml +
-      '<button class="mit-list-item mit-list-item-accent" data-choose-new="1">' + icon('plus', 15) + ' Yeni Kalıp Oluştur</button>' +
-      '</div>';
-    var el = Modals.openSheet(pickId, html);
-    el.querySelector('[data-close]').onclick = function () { Modals.closeSheet(pickId); };
-    Array.prototype.forEach.call(el.querySelectorAll('[data-choose-group]'), function (b) {
-      b.onclick = function () {
-        var gid = b.dataset.chooseGroup;
-        draft.patternGroups = draft.patternGroups.map(function (g) {
-          return g.id === gid ? Object.assign({}, g, { fabricRolls: g.fabricRolls.concat(selectedRolls) }) : g;
-        });
-        draft.unassignedRolls = draft.unassignedRolls.filter(function (r) { return selectedIds.indexOf(r.id) < 0; });
-        selectedUnassigned = {};
-        expandedGroupId = gid;
-        Modals.closeSheet(pickId);
-        paint();
-      };
-    });
-    el.querySelector('[data-choose-new]').onclick = function () {
-      Modals.closeSheet(pickId);
-      openPatternPicker(function (name) {
-        var newGroup = { id: uid(), patternName: name, fabricRolls: selectedRolls.slice() };
-        draft.patternGroups = draft.patternGroups.concat([newGroup]);
-        draft.unassignedRolls = draft.unassignedRolls.filter(function (r) { return selectedIds.indexOf(r.id) < 0; });
-        selectedUnassigned = {};
-        expandedGroupId = newGroup.id;
-        paint();
-      });
-    };
-  }
-
-  function renderGroupsList() {
-    var container = document.getElementById('jf-groups-list');
-    if (!container) return;
-    var html = draft.patternGroups.map(function (g) {
-      var t = calcRollTotals(g.fabricRolls, draft.fabricGramsPerMeter);
-      var expanded = expandedGroupId === g.id;
-      var canDelete = draft.patternGroups.length > 1;
-      return '<div class="mit-pattern-group-card">' +
-        '<div class="mit-pattern-group-top">' +
-        '<button class="mit-pattern-group-name-btn" data-pick-pattern="' + g.id + '">' + icon('tag', 15, 'mit-accent') +
-        '<span class="' + (g.patternName ? '' : 'mit-muted') + '">' + esc(g.patternName || 'Kalıp seçilmedi') + '</span></button>' +
-        (g.fabricRolls.length ? '<span class="mit-pattern-group-total" data-group-total="' + g.id + '">' + fmtNum(t.grandTotalMeters) + ' mt' + (!expanded ? ' <span class="mit-muted">(' + g.fabricRolls.length + ' top)</span>' : '') + '</span>' : '<span class="mit-pattern-group-total" data-group-total="' + g.id + '"></span>') +
-        (canDelete ? '<button class="mit-icon-btn mit-icon-sm" data-delete-group="' + g.id + '" aria-label="Kalıbı Kaldır">' + icon('x', 16) + '</button>' : '') +
-        '<button class="mit-icon-btn mit-icon-sm" data-toggle-group="' + g.id + '" aria-label="' + (expanded ? 'Daralt' : 'Genişlet') + '">' + icon(expanded ? 'chevronUp' : 'chevronDown', 16) + '</button>' +
-        '</div>' +
-        (expanded ? '<div class="mit-pattern-group-body" id="group-body-' + g.id + '"></div>' : '') +
-        '</div>';
-    }).join('');
-    container.innerHTML = html;
-
-    draft.patternGroups.forEach(function (g) {
-      if (expandedGroupId === g.id) {
-        var key = 'group_' + g.id;
-        if (!rollControllers[key]) {
-          rollControllers[key] = createFabricRollController(
-            function () { return currentGroup(g.id).fabricRolls; },
-            function (rolls) {
-              draft.patternGroups = draft.patternGroups.map(function (gg) { return gg.id === g.id ? Object.assign({}, gg, { fabricRolls: rolls }) : gg; });
-              refreshTotalsOnly();
-            },
-            function () { return draft.fabricGramsPerMeter; }
-          );
-        }
-        var bodyId = 'group-body-' + g.id;
-        document.getElementById(bodyId).innerHTML = '<div id="roll-ui-' + g.id + '"></div>';
-        rollControllers['group_' + g.id].renderInto('roll-ui-' + g.id);
-      }
-    });
-
-    Array.prototype.forEach.call(container.querySelectorAll('[data-toggle-group]'), function (b) {
-      b.onclick = function () {
-        var gid = b.dataset.toggleGroup;
-        expandedGroupId = expandedGroupId === gid ? null : gid;
-        renderGroupsList();
-        refreshTotalsOnly();
-      };
-    });
-    Array.prototype.forEach.call(container.querySelectorAll('[data-pick-pattern]'), function (b) {
-      b.onclick = function () {
-        var gid = b.dataset.pickPattern;
-        openPatternPicker(function (name) {
-          draft.patternGroups = draft.patternGroups.map(function (g) { return g.id === gid ? Object.assign({}, g, { patternName: name }) : g; });
-          renderGroupsList();
-        });
-      };
-    });
-    Array.prototype.forEach.call(container.querySelectorAll('[data-delete-group]'), function (b) {
-      b.onclick = function () {
-        var gid = b.dataset.deleteGroup;
-        var removed = currentGroup(gid);
-        Confirm.show({
-          title: 'Kalıp Kaldırılsın mı?',
-          message: 'Bu kalıp ve içindeki tüm kumaş topu bilgileri kaldırılacak.',
-          onConfirm: function () {
-            draft.patternGroups = draft.patternGroups.filter(function (g) { return g.id !== gid; });
-            if (expandedGroupId === gid) expandedGroupId = null;
-            paint();
-            if (removed) {
-              Toast.showUndo((removed.patternName || 'Kalıp') + ' kaldırıldı', function () {
-                draft.patternGroups = draft.patternGroups.concat([removed]);
-                paint();
-              });
-            }
-          }
-        });
-      };
-    });
-  }
-  function currentGroup(gid) {
-    var found = null;
-    draft.patternGroups.forEach(function (g) { if (g.id === gid) found = g; });
-    return found;
-  }
-
-  // Toplamları ve kalıp başlıklarındaki metrajı, giriş kutusunu bozmadan günceller.
-  // (paint() çağırmak modal'ı baştan çizer ve klavyeyi kapatır — bu yüzden kullanılmaz.)
-  function refreshTotalsOnly() {
-    var jobTotals = calcJobTotals(draft);
-    var gt = document.getElementById('jf-grand-total');
-    if (gt) {
-      if (jobTotals.grandTotalMeters > 0) {
-        gt.innerHTML = '<div class="mit-row-between"><span>İşin Genel Toplamı</span>' +
-          '<span class="mit-grand-total-value">' + fmtNum(jobTotals.grandTotalMeters) + ' mt</span></div>' +
-          '<p class="mit-grand-total-sub">' + (jobTotals.meterRolls.length + jobTotals.kgRolls.length) + ' top · ' +
-          fmtNum(jobTotals.totalMeters) + ' mt + ' + fmtNum(jobTotals.totalKg) + ' kg</p>';
-        gt.style.display = '';
-      } else {
-        gt.innerHTML = '';
-        gt.style.display = 'none';
-      }
-    }
-    // Kalıp başlıklarındaki toplamlar
-    draft.patternGroups.forEach(function (g) {
-      var el = document.querySelector('[data-group-total="' + g.id + '"]');
-      if (!el) return;
-      var t = calcRollTotals(g.fabricRolls, draft.fabricGramsPerMeter);
-      var expanded = expandedGroupId === g.id;
-      el.innerHTML = g.fabricRolls.length
-        ? (fmtNum(t.grandTotalMeters) + ' mt' + (!expanded ? ' <span class="mit-muted">(' + g.fabricRolls.length + ' top)</span>' : ''))
-        : '';
-    });
-    // Atanmamış toplar başlığı
-    var ul = document.getElementById('jf-unassigned-label');
-    if (ul) {
-      ul.textContent = 'Atanmamış Toplar' + (draft.unassignedRolls.length ? ' (' + draft.unassignedRolls.length + ' top)' : '');
-    }
-  }
-
-  function openPatternPicker(onSelect) {
-    var pickId = 'modal-pattern-picker';
-    var search = '';
-    function paintPicker() {
-      var list = App.patterns.slice().sort(function (a, b) { return a.name.localeCompare(b.name, 'tr'); });
-      var q = search.trim().toLowerCase();
-      if (q) list = list.filter(function (p) { return p.name.toLowerCase().indexOf(q) >= 0; });
-      var gridHtml;
-      if (!App.patterns.length) {
-        gridHtml = '<p class="mit-empty">Henüz kalıp eklenmedi. Ayarlar &gt; Kalıp Kütüphanesi\'nden ekleyebilirsin.</p>';
-      } else if (!list.length) {
-        gridHtml = '<p class="mit-empty">Sonuç bulunamadı</p>';
-      } else {
-        gridHtml = '<div class="mit-pattern-grid">' + list.map(function (p) {
-          return '<button class="mit-pattern-pick-tile" data-pick="' + p.id + '">' +
-            '<div class="mit-pattern-tile-img">' + (p.photo ? '<img src="' + p.photo + '" alt="" />' : icon('tag', 24, 'mit-muted')) + '</div>' +
-            '<p class="mit-pattern-tile-name">' + esc(p.name) + '</p></button>';
-        }).join('') + '</div>';
-      }
-      var html = '<div class="mit-modal-header"><h3>Kalıp Seç</h3><button class="mit-icon-btn" data-close="1">' + icon('x', 22) + '</button></div>' +
-        '<div class="mit-modal-content-tight"><div class="mit-search-wrap"><span class="mit-search-icon">' + icon('search', 18) + '</span>' +
-        '<input type="text" id="pp-search" class="mit-input mit-search-input" placeholder="Kalıp ara..." value="' + esc(search) + '" /></div></div>' +
-        '<div class="mit-modal-content">' + gridHtml + '</div>';
-      var el = document.getElementById(pickId);
-      if (!el) el = Modals.openSheet(pickId, html);
-      else el.querySelector('.mit-modal-sheet').innerHTML = html;
-      el.querySelector('[data-close]').onclick = function () { Modals.closeSheet(pickId); };
-      var searchInput = document.getElementById('pp-search');
-      searchInput.oninput = function () { search = searchInput.value; paintPicker(); var ni = document.getElementById('pp-search'); ni.focus(); ni.setSelectionRange(ni.value.length, ni.value.length); };
-      Array.prototype.forEach.call(el.querySelectorAll('[data-pick]'), function (b) {
-        b.onclick = function () {
-          var p = App.patterns.filter(function (x) { return x.id === b.dataset.pick; })[0];
-          Modals.closeSheet(pickId);
-          if (p) onSelect(p.name);
-        };
-      });
-    }
-    paintPicker();
-  }
-
-  function wireStatic() {
-    var el = document.getElementById(id);
-    el.querySelector('[data-close]').onclick = function () { Modals.closeSheet(id); };
-
-    var toggleBtn = document.getElementById('jf-toggle-status');
-    if (toggleBtn) toggleBtn.onclick = function () {
-      if (draft.status === 'active') { draft.status = 'delivered'; draft.deliveredAt = new Date().toISOString(); }
-      else { draft.status = 'active'; draft.deliveredAt = null; }
-      paint();
-    };
-
-    document.getElementById('jf-fabric-type').oninput = function (e) { draft.fabricType = e.target.value; };
-    document.getElementById('jf-fabric-color').oninput = function (e) { draft.fabricColor = e.target.value; };
-    document.getElementById('jf-grams').oninput = function (e) {
-      draft.fabricGramsPerMeter = e.target.value === '' ? null : parseFloat(e.target.value);
-      // Gramaj değişince kilo toplarının metre karşılığı da değişir:
-      // tüm top listelerini ve toplamları yeniden hesapla (giriş kutularına dokunmadan)
-      if (rollControllers.unassigned) {
-        rollControllers.unassigned.renderDynamic();
-        renderSendButton(); // yeniden çizim seçim dinleyicilerini siler, tekrar bağla
-      }
-      draft.patternGroups.forEach(function (g) {
-        var c = rollControllers['group_' + g.id];
-        if (c) c.renderDynamic();
-      });
-      refreshTotalsOnly();
-    };
-    document.getElementById('jf-notes').oninput = function (e) { draft.notes = e.target.value; };
-
-    document.getElementById('jf-add-group').onclick = function () {
-      var g = emptyPatternGroup();
-      draft.patternGroups = draft.patternGroups.concat([g]);
-      expandedGroupId = g.id;
-      renderGroupsList();
-    };
-
-    var camInput = document.getElementById('jf-camera-input');
-    var galInput = document.getElementById('jf-gallery-input');
-    document.getElementById('jf-camera-btn').onclick = function () { camInput.click(); };
-    document.getElementById('jf-gallery-btn').onclick = function () { galInput.click(); };
-    function handlePhotos(files) {
-      var remaining = 25 - draft.photos.length;
-      if (remaining <= 0) { Toast.show('En fazla 25 fotoğraf eklenebilir', 'error'); return; }
-      var toUse = Array.prototype.slice.call(files).slice(0, remaining);
-      if (files.length > remaining) Toast.show('Sadece ' + remaining + ' fotoğraf daha eklenebildi (limit 25)', 'info');
-      compressImageFiles(toUse, 800, 0.7).then(function (compressed) {
-        draft.photos = draft.photos.concat(compressed);
-        document.getElementById('jf-photos-grid').innerHTML = photosGridHtml();
-        wirePhotoGrid();
-      });
-    }
-    camInput.onchange = function () { if (camInput.files.length) handlePhotos(camInput.files); camInput.value = ''; };
-    galInput.onchange = function () { if (galInput.files.length) handlePhotos(galInput.files); galInput.value = ''; };
-    wirePhotoGrid();
-
-    var deleteJobBtn = document.getElementById('jf-delete-job');
-    if (deleteJobBtn) deleteJobBtn.onclick = function () {
-      Confirm.show({
-        title: 'İş Silinsin mi?',
-        message: 'Bu iş kalıcı olarak silinecek. Bu işlem geri alınamaz.',
-        onConfirm: function () {
-          var removedJob = draft;
-          customer.jobs = customer.jobs.filter(function (j) { return j.id !== removedJob.id; });
-          var updated = Object.assign({}, customer, { updatedAt: new Date().toISOString() });
-          App.customers = App.customers.map(function (c) { return c.id === customer.id ? updated : c; });
-          App.persistCustomers();
-          Modals.closeSheet(id);
-          App.render();
-          Toast.showUndo('İş silindi', function () {
-            var c2 = App.findCustomer(customer.id);
-            c2.jobs.push(removedJob);
-            App.persistCustomers();
-            App.render();
-          });
-        }
-      });
-    };
-
-    document.getElementById('jf-save').onclick = function () {
-      saveCustomer();
-      Modals.closeSheet(id);
-      App.render();
-    };
-  }
-
-  function wirePhotoGrid() {
-    Array.prototype.forEach.call(document.querySelectorAll('[data-photo-view]'), function (img) {
-      img.onclick = function () { Modals.showLightbox(draft.photos, parseInt(img.dataset.photoView, 10)); };
-    });
-    Array.prototype.forEach.call(document.querySelectorAll('[data-photo-delete]'), function (b) {
-      b.onclick = function () {
-        var idx = parseInt(b.dataset.photoDelete, 10);
-        var removedPhoto = draft.photos[idx];
-        Confirm.show({
-          title: 'Fotoğraf Silinsin mi?',
-          message: 'Bu fotoğrafı silmek istediğine emin misin?',
-          onConfirm: function () {
-            draft.photos = draft.photos.filter(function (_, i) { return i !== idx; });
-            document.getElementById('jf-photos-grid').innerHTML = photosGridHtml();
-            wirePhotoGrid();
-            Toast.showUndo('Fotoğraf silindi', function () {
-              var next = draft.photos.slice();
-              next.splice(Math.min(idx, next.length), 0, removedPhoto);
-              draft.photos = next;
-              document.getElementById('jf-photos-grid').innerHTML = photosGridHtml();
-              wirePhotoGrid();
-            });
-          }
-        });
-      };
-    });
-  }
-
-  paint();
-};
-
-/* ============ Fotoğraf Lightbox (kaydırmalı) ============ */
-Modals.showLightbox = function (photos, startIndex) {
-  var index = startIndex;
-  var id = 'modal-lightbox';
-  var touchStartX = null;
-
-  function paint() {
-    var html = '<div class="mit-lightbox">' +
-      '<button class="mit-icon-btn mit-lightbox-close" data-lb-close="1" aria-label="Kapat">' + icon('x', 24) + '</button>' +
-      (photos.length > 1 ? '<button class="mit-icon-btn mit-lightbox-prev" data-lb-prev="1" aria-label="Önceki">' + icon('chevronLeft', 26) + '</button>' : '') +
-      (photos.length > 1 ? '<button class="mit-icon-btn mit-lightbox-next" data-lb-next="1" aria-label="Sonraki">' + icon('chevronRight', 26) + '</button>' : '') +
-      '<img src="' + photos[index] + '" alt="Fotoğraf ' + (index + 1) + '" class="mit-lightbox-img" draggable="false" />' +
-      (photos.length > 1 ? '<div class="mit-lightbox-counter">' + (index + 1) + ' / ' + photos.length + '</div>' : '') +
-      '</div>';
-    var el = document.getElementById(id);
-    if (!el) {
-      el = document.createElement('div');
-      el.id = id;
-      el.className = 'mit-modal-overlay mit-lightbox-overlay';
-      document.body.appendChild(el);
-    }
-    el.innerHTML = html;
-    wire(el);
-  }
-  function wire(el) {
-    el.querySelector('[data-lb-close]').onclick = function () { Modals.closeSheet(id); };
-    var prev = el.querySelector('[data-lb-prev]');
-    var next = el.querySelector('[data-lb-next]');
-    if (prev) prev.onclick = function () { index = (index - 1 + photos.length) % photos.length; paint(); };
-    if (next) next.onclick = function () { index = (index + 1) % photos.length; paint(); };
-    el.ontouchstart = function (e) { touchStartX = e.touches[0].clientX; };
-    el.ontouchend = function (e) {
-      if (touchStartX === null) return;
-      var diff = e.changedTouches[0].clientX - touchStartX;
-      if (Math.abs(diff) > 50) {
-        if (diff > 0) index = (index - 1 + photos.length) % photos.length;
-        else index = (index + 1) % photos.length;
-        paint();
-      }
-      touchStartX = null;
-    };
-  }
-  paint();
-};
-
-/* ============ İş Özeti / Paylaşım ============
-   html2canvas gibi bir kütüphane kullanmadan, özet bilgisini doğrudan bir
-   <canvas> üzerine elle çizip PNG olarak üretiyoruz. Bu sayede dış bir
-   bağımlılık gerekmiyor. */
-Modals.showJobInfo = function (customer, job) {
-  var id = 'modal-job-info';
-  var jobTotals = calcJobTotals(job);
-  var displayName = jobDisplayName(job);
-  var statusText = (job.status === 'delivered' && job.deliveredAt)
-    ? ('Teslim Edildi (' + fmtDate(job.deliveredAt) + ')')
-    : 'İmalatta / Aktif';
-
-  var rowsHtml = '<div class="mit-info-rows">' +
-    infoRow('Müşteri', customer.name) +
-    infoRow('İş / Model', displayName) +
-    infoRow('İş Durumu', statusText) +
-    infoRow('Kumaş', (job.fabricType || '') + ' - ' + (job.fabricColor || '') + (job.fabricGramsPerMeter ? (' (1 mt: ' + job.fabricGramsPerMeter + ' gr)') : '')) +
-    (job.notes ? infoRow('Not', job.notes) : '') +
-    infoRow('Fotoğraf', job.photos.length + ' adet') +
-    '</div>';
-
-  var breakdownHtml = '<div class="mit-info-breakdown"><p class="mit-info-breakdown-title">KUMAŞ TOPLARI</p>';
-  if (job.unassignedRolls.length) {
-    var ut = calcRollTotals(job.unassignedRolls, job.fabricGramsPerMeter);
-    breakdownHtml += rollBreakdownBlock('Atanmamış Toplar', ut, true, 'unassigned');
-  }
-  job.patternGroups.forEach(function (g) {
-    if (!g.fabricRolls.length) return;
-    var t = calcRollTotals(g.fabricRolls, job.fabricGramsPerMeter);
-    breakdownHtml += rollBreakdownBlock(g.patternName || 'İsimsiz Kalıp', t, true, 'pattern');
-  });
-  breakdownHtml += '<p class="mit-info-grand-total">Genel Toplam: ' + fmtNum(jobTotals.grandTotalMeters) + ' mt (' +
-    (jobTotals.meterRolls.length + jobTotals.kgRolls.length) + ' Top)</p></div>';
-
-  var html = '<div class="mit-modal-header"><h3>İş Özeti</h3><button class="mit-icon-btn" data-close="1">' + icon('x', 22) + '</button></div>' +
-    '<div class="mit-modal-content">' +
-    '<div class="mit-info-capture" id="mit-info-capture">' +
-    '<p class="mit-info-heading">İŞ DETAYI</p>' + rowsHtml + breakdownHtml +
-    '</div></div>' +
-    '<div class="mit-modal-footer"><button class="mit-btn mit-btn-primary mit-btn-block" id="jf-share-btn">' + icon('share', 20) + ' Görsel Olarak Paylaş</button></div>';
-
-  var el = Modals.openSheet(id, html);
-  el.querySelector('[data-close]').onclick = function () { Modals.closeSheet(id); };
-  document.getElementById('jf-share-btn').onclick = function (e) {
-    var btn = e.currentTarget;
-    shareJobSummaryImage(btn, customer, job, jobTotals, displayName, statusText);
-  };
-
-  function infoRow(label, value) {
-    return '<div class="mit-info-row"><span class="mit-info-label">' + esc(label) + ':</span><span class="mit-info-value">' + esc(value) + '</span></div>';
-  }
-  function rollBreakdownBlock(title, t, showTitle, variant) {
-    var frameCls = variant === 'unassigned' ? 'mit-info-group-unassigned' : 'mit-info-group-pattern';
-    var h = '<div class="mit-info-group ' + frameCls + '">';
-    if (showTitle) h += '<p class="mit-info-group-title">' + esc(title) + '</p>';
-    if (t.meterRolls.length) {
-      h += '<p class="mit-info-sub mit-info-sub-mt">Metre Topları</p><div class="mit-info-chip-grid">' +
-        t.meterRolls.map(function (r) { return '<div class="mit-info-chip mit-info-chip-mt">' + r.value + '</div>'; }).join('') + '</div>' +
-        '<p class="mit-info-note">Toplam Metre: ' + fmtNum(t.totalMeters) + ' mt (' + t.meterRolls.length + ' Top)</p>';
-    }
-    if (t.kgRolls.length) {
-      h += '<p class="mit-info-sub mit-info-sub-kg">Kilo Topları</p><div class="mit-info-chip-grid">' +
-        t.kgRolls.map(function (r) { return '<div class="mit-info-chip mit-info-chip-kg">' + r.value + '</div>'; }).join('') + '</div>' +
-        '<p class="mit-info-note">Toplam Kilo: ' + fmtNum(t.totalKg) + ' kg (' + t.kgRolls.length + ' Top)' + (t.kgEquivalentMeters > 0 ? (' ≈ ' + fmtNum(t.kgEquivalentMeters) + ' mt') : '') + '</p>';
-    }
-    if (showTitle) h += '<p class="mit-info-group-total">Kalıp Toplamı: ' + fmtNum(t.grandTotalMeters) + ' mt (' + (t.meterRolls.length + t.kgRolls.length) + ' Top)</p>';
-    h += '</div>';
-    return h;
-  }
-};
-
-/* Canvas üzerinde basit ama okunaklı bir özet görseli çizer. */
-function shareJobSummaryImage(btn, customer, job, jobTotals, displayName, statusText) {
-  btn.disabled = true;
-  var originalHtml = btn.innerHTML;
-  btn.innerHTML = icon('loader', 20, 'mit-spin') + ' Hazırlanıyor...';
-
-  var W = 720;
-  var pad = 32;
-  var lineH = 30;
-  var lines = [];
-  lines.push({ text: 'İŞ DETAYI', size: 20, bold: true, color: '#2dd4bf', center: true, gapAfter: 18 });
-  lines.push({ text: 'Müşteri: ' + customer.name, size: 17 });
-  lines.push({ text: 'İş / Model: ' + displayName, size: 17 });
-  lines.push({ text: 'İş Durumu: ' + statusText, size: 17 });
-  var fabricLine = 'Kumaş: ' + (job.fabricType || '') + ' - ' + (job.fabricColor || '') + (job.fabricGramsPerMeter ? (' (1 mt: ' + job.fabricGramsPerMeter + ' gr)') : '');
-  lines.push({ text: fabricLine, size: 17 });
-  if (job.notes) lines.push({ text: 'Not: ' + job.notes, size: 16, wrap: true });
-  lines.push({ text: 'Fotoğraf: ' + job.photos.length + ' adet', size: 17, gapAfter: 16 });
-
-  function pushRollBlock(title, t, showTitle) {
-    if (showTitle) lines.push({ text: title, size: 16, bold: true, color: '#e5e7eb' });
-    if (t.meterRolls.length) {
-      lines.push({ text: 'Metre Topları: ' + t.meterRolls.map(function (r) { return r.value + ' mt'; }).join(', '), size: 14, color: '#2dd4bf', wrap: true });
-      lines.push({ text: 'Toplam Metre: ' + fmtNum(t.totalMeters) + ' mt (' + t.meterRolls.length + ' Top)', size: 14, color: '#9ca3af' });
-    }
-    if (t.kgRolls.length) {
-      lines.push({ text: 'Kilo Topları: ' + t.kgRolls.map(function (r) { return r.value + ' kg'; }).join(', '), size: 14, color: '#f59e0b', wrap: true });
-      var s = 'Toplam Kilo: ' + fmtNum(t.totalKg) + ' kg (' + t.kgRolls.length + ' Top)';
-      if (t.kgEquivalentMeters > 0) s += ' ≈ ' + fmtNum(t.kgEquivalentMeters) + ' mt';
-      lines.push({ text: s, size: 14, color: '#9ca3af' });
-    }
-    if (showTitle) lines.push({ text: 'Kalıp Toplamı: ' + fmtNum(t.grandTotalMeters) + ' mt', size: 14, gapAfter: 12 });
-  }
-
-  lines.push({ text: 'KUMAŞ TOPLARI', size: 15, bold: true, color: '#9ca3af', gapAfter: 8 });
-  if (job.unassignedRolls.length) {
-    var ut = calcRollTotals(job.unassignedRolls, job.fabricGramsPerMeter);
-    pushRollBlock('Atanmamış Toplar', ut, true);
-  }
-  job.patternGroups.forEach(function (g) {
-    if (!g.fabricRolls.length) return;
-    var t = calcRollTotals(g.fabricRolls, job.fabricGramsPerMeter);
-    pushRollBlock(g.patternName || 'İsimsiz Kalıp', t, true);
-  });
-  lines.push({
-    text: 'Genel Toplam: ' + fmtNum(jobTotals.grandTotalMeters) + ' mt (' + (jobTotals.meterRolls.length + jobTotals.kgRolls.length) + ' Top)',
-    size: 18, bold: true, color: '#f3f4f6', gapBefore: 10
-  });
-
-  // Yükseklik ölçümü için geçici canvas
-  var measureCanvas = document.createElement('canvas');
-  var mctx = measureCanvas.getContext('2d');
-  var maxTextWidth = W - pad * 2;
-  var totalH = pad;
-  var wrappedLines = [];
-  lines.forEach(function (line) {
-    totalH += (line.gapBefore || 0);
-    mctx.font = (line.bold ? 'bold ' : '') + line.size + 'px Arial, sans-serif';
-    var parts = line.wrap ? wrapText(mctx, line.text, maxTextWidth) : [line.text];
-    parts.forEach(function (p) {
-      wrappedLines.push({ text: p, size: line.size, bold: line.bold, color: line.color || '#e5e7eb', center: line.center });
-      totalH += lineH * (line.size > 18 ? 1.2 : 1);
-    });
-    totalH += (line.gapAfter || 4);
-  });
-  totalH += pad;
-
-  var canvas = document.createElement('canvas');
-  canvas.width = W;
-  canvas.height = Math.ceil(totalH);
-  var ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#1f2937';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  var y = pad;
-  var li = 0;
-  lines.forEach(function (line) {
-    y += (line.gapBefore || 0);
-    ctx.font = (line.bold ? 'bold ' : '') + line.size + 'px Arial, sans-serif';
-    ctx.fillStyle = line.color || '#e5e7eb';
-    var parts = line.wrap ? wrapText(ctx, line.text, maxTextWidth) : [line.text];
-    parts.forEach(function (p) {
-      y += lineH * (line.size > 18 ? 1.2 : 1);
-      if (line.center) {
-        ctx.textAlign = 'center';
-        ctx.fillText(p, W / 2, y);
-        ctx.textAlign = 'left';
-      } else {
-        ctx.fillText(p, pad, y);
-      }
-    });
-    y += (line.gapAfter || 4);
-  });
-
-  canvas.toBlob(async function (blob) {
-    if (!blob) {
-      Toast.show('Görsel oluşturulamadı', 'error');
-      btn.disabled = false; btn.innerHTML = originalHtml;
-      return;
-    }
-    var result = await shareImageBlob(blob, (displayName || 'is-ozeti') + '.png');
-    if (result === 'downloaded') Toast.show('Görsel indirildi');
-    btn.disabled = false; btn.innerHTML = originalHtml;
-  }, 'image/png');
-}
-function wrapText(ctx, text, maxWidth) {
-  var words = String(text).split(' ');
-  var lines = [];
-  var current = '';
-  words.forEach(function (w) {
-    var test = current ? (current + ' ' + w) : w;
-    if (ctx.measureText(test).width > maxWidth && current) {
-      lines.push(current);
-      current = w;
-    } else {
-      current = test;
-    }
-  });
-  if (current) lines.push(current);
-  return lines;
-}
-
-/* ============ Günlük Yedekleme Hatırlatıcısı ============ */
-Modals.showDailyReminder = function () {
-  var id = 'modal-daily-reminder';
-  var html = '<div class="mit-modal-header"><h3>Günlük Yedekleme Hatırlatıcısı</h3>' +
-    '<button class="mit-icon-btn" data-close="1">' + icon('x', 18) + '</button></div>' +
-    '<div class="mit-modal-content"><p class="mit-block-desc">Verilerini kaybetmemek için günlük yedek almanı öneririz. Şimdi yedeklemek ister misin?</p></div>' +
-    '<div class="mit-modal-footer mit-footer-split">' +
-    '<button class="mit-btn mit-btn-secondary mit-btn-flex1" id="dr-later">Daha Sonra</button>' +
-    '<button class="mit-btn mit-btn-primary mit-btn-flex1" id="dr-now">' + icon('download', 18) + ' Şimdi Yedekle</button>' +
-    '</div>';
-  var el = Modals.openSheet(id, html, { persistent: true });
-  function close() { App.dismissDailyReminder(); Modals.closeSheet(id); }
-  el.querySelector('[data-close]').onclick = close;
-  document.getElementById('dr-later').onclick = close;
-  document.getElementById('dr-now').onclick = async function (e) {
-    var btn = e.currentTarget;
-    btn.disabled = true;
-    btn.innerHTML = icon('loader', 18, 'mit-spin') + ' Hazırlanıyor...';
-    try {
-      await downloadAndShareBackup(App.customers);
-      Toast.show('Yedek dosyası indirildi');
-    } catch (err) {
-      console.error(err);
-      Toast.show('Yedekleme sırasında hata oluştu', 'error');
-    }
-    close();
-  };
-};
-
-
-document.addEventListener('DOMContentLoaded', function () { App.init(); });
-</script>
-</body>
-</html>
