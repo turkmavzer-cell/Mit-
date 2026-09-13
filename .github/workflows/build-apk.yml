@@ -26,6 +26,11 @@ jobs:
       - name: Bağımlılıkları kur
         run: npm install
 
+      - name: Sabit imzalama anahtarını yerleştir
+        run: |
+          mkdir -p ~/.android
+          cp keystore/debug.keystore ~/.android/debug.keystore
+
       - name: Android projesini oluştur (Capacitor)
         run: npx cap add android
 
