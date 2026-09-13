@@ -1,6 +1,6 @@
 {
-  "appId": "com.turkmavzercell.istakip",
-  "appName": "MİT",
+  "appId": "com.turkmavzercell.istakiptest",
+  "appName": "MİT Test",
   "webDir": "www",
   "backgroundColor": "#111827",
   "android": {
